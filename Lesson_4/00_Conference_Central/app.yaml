@@ -1,4 +1,4 @@
-application: ud858-dev-playground
+application: conf-org-app
 version: 1
 runtime: python27
 api_version: 1
@@ -34,6 +34,14 @@ handlers:       # static then dynamic
   script: conference.api
   secure: always
 
+- url: /crons/set_announcement
+  script: main.app
+  login: admin
+
+- url: /tasks/send_confirmation_email
+  script: main.app
+  login: admin
+
 libraries:
 
 - name: endpoints
@@ -42,3 +50,4 @@ libraries:
 # pycrypto library used for OAuth2 (req'd for authenticated APIs)
 - name: pycrypto
   version: latest
+
