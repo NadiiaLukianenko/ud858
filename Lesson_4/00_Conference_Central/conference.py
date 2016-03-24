@@ -13,8 +13,7 @@ created by wesc on 2014 apr 21
 __author__ = 'wesc+api@google.com (Wesley Chun)'
 
 
-from datetime import datetime
-
+import datetime
 import endpoints
 from protorpc import messages
 from protorpc import message_types
@@ -41,6 +40,9 @@ from models import Speaker
 from models import SpeakerForm
 from models import SessionForms
 from models import SpeakerForms
+from collections import Counter
+import operator
+
 
 EMAIL_SCOPE = endpoints.EMAIL_SCOPE
 API_EXPLORER_CLIENT_ID = endpoints.API_EXPLORER_CLIENT_ID
@@ -102,7 +104,7 @@ SESS_GET_REQUEST_TYPE = endpoints.ResourceContainer(
 
 
 MEMCACHE_ANNOUNCEMENTS_KEY = "Test"
-
+MEMCACHE_FEATURED_SPEAKER = "FeaturedSpeaker"
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 
@@ -559,7 +561,8 @@ class ConferenceApi(remote.Service):
             data['key'] = c_key
 
             # Find and add keySpeaker by e-mail
-            speakerKey = ndb.Key(Speaker, request.speakerEmail)
+            speakerEmail = request.speakerEmail
+            speakerKey = ndb.Key(Speaker, speakerEmail)
             speaker = speakerKey.get()
             if not speaker:
                 raise endpoints.BadRequestException("Speaker email is incorrect")
@@ -568,6 +571,11 @@ class ConferenceApi(remote.Service):
 
         # create Session & return (modified) SessionForm
         Session(**data).put()
+        # add memcache if the speaker already has more than 1 session
+        taskqueue.add(params={'speakerEmail': speakerEmail},
+            url='/tasks/set_featuredspeaker'
+            )
+
         return BooleanMessage(data=True)
 
     @endpoints.method(SESS_GET_REQUEST, BooleanMessage,
@@ -733,7 +741,7 @@ class ConferenceApi(remote.Service):
     # TODO: test this endpoint
     @endpoints.method(SESS_GET_REQUEST, SessionForms,
             path='sessions/wishlist',
-            http_method='GET', name='getConferencesToAttend')
+            http_method='GET', name='getSessionsFromWishList')
     def getSessionsFromWishList(self, request):
         """Get list of session from conference that user is interested in."""
         prof = self._getProfileFromUser() # get user Profile
@@ -756,6 +764,97 @@ class ConferenceApi(remote.Service):
                           http_method='GET', name='deleteFromWishlist')
     def deleteFromWishlist(self, request):
         return self._sessionToWishlist(request, wish=False)
+
+    @endpoints.method(message_types.VoidMessage, SessionForms,
+                        path='filterSessions',
+                        http_method='GET', name='filterSessions')
+    def filterSessions(self, request):
+        sessions = Session.query(ndb.OR(Session.typeOfSession < 'workshop',
+                                        Session.typeOfSession > 'workshop'))\
+            .fetch()
+        new_sessions = [s for s in sessions
+                        if s.startTime < datetime.time(19, 0, 0)]
+
+        return SessionForms(
+            items=[self._copySessionToForm(s) for s in new_sessions])
+
+    @endpoints.method(SESS_GET_REQUEST_KEY, SessionForms,
+                      path='getAtTheSameDay',
+                      name='getSessionsAtTheSameDay',
+                      http_method='GET')
+    def getSessionsAtTheSameDay(self, request):
+        """
+        find all sessions at the same day as requested session
+        """
+        wsck = request.websafeKey
+        session = ndb.Key(urlsafe=wsck).get()
+        if not session:
+            raise endpoints.NotFoundException(
+                'No session found with key: %s' % wsck)
+        conferenceKey = session.conferenceKey
+        date = session.date
+        name = session.sessionName
+        # make conference key
+        c_key = ndb.Key(Conference, conferenceKey)
+        # create ancestor query for this conference
+        sessions = Session.query(ancestor=c_key)
+        sessions = sessions.filter(Session.date == date)
+        sessions = sessions.filter(Session.sessionName != name)
+        return SessionForms(
+            items=[self._copySessionToForm(s) for s in sessions])
+
+
+    @endpoints.method(SESS_GET_REQUEST_CONF, SessionForms,
+        path='getMostPopularSessions', http_method='GET',
+        name='getMostPopularSessions')
+    def getMostPopularSession(self, request):
+        """Return most popular session in conference."""
+        # make conference key
+        c_key = ndb.Key(Conference, request.websafeConferenceKey)
+        # create ancestor query for this conference
+        sessions = Session.query(ancestor=c_key)
+        # List of all conf sessions ids
+        sess_keys = [session.key.urlsafe() for session in sessions]
+        # List of all sessions in all wishlists
+        sessionsInWishList = []
+        for p in Profile.query():
+             sessionsInWishList.extend(p.sessionKeysToWishList)
+        sessionsCount = Counter(sessionsInWishList)
+        keys = set(sess_keys).intersection(set(sessionsCount))
+        confSessionsInWishLists = {i: sessionsCount[i] for i in keys}
+        # get most popular session key
+        keyOfMostPopularSession = sorted(confSessionsInWishLists.items(),
+                            key=operator.itemgetter(1), reverse=True)[0][0]
+        # return most popular session
+        session = ndb.Key(urlsafe=keyOfMostPopularSession).get()
+        return SessionForms(
+            items=[self._copySessionToForm(session)])
+
+
+    @endpoints.method(message_types.VoidMessage, StringMessage,
+                      path='sessions/featuredspeaker',
+                      http_method='GET', name='getFeaturedSpeaker')
+    def getFeaturedSpeaker(self, request):
+        featuredspeaker = memcache.get(MEMCACHE_FEATURED_SPEAKER)
+        return StringMessage(data=featuredspeaker)
+
+    @staticmethod
+    def _featuredSpeaker(speakerEmail):
+        """
+        Create announcement about featured Speaker
+        """
+        featuredSpeaker = ""
+        speaker = Speaker.query(Speaker.speakerEmail==speakerEmail).fetch()
+        speakerKey = ndb.Key(Speaker, speakerEmail)
+        sessions = Session.query(Session.keySpeaker == speakerKey)
+        if sessions.count() > 1:
+            featuredSpeaker = '%s %s %s %s' % (
+                'Let us introduce featured speaker ',
+                [sp.speakerName for sp in speaker],
+                ' with sessions: ',
+                ', '.join(session.sessionName for session in sessions))
+            memcache.set(MEMCACHE_FEATURED_SPEAKER, featuredSpeaker)
+        return featuredSpeaker
 
 
 # registers API
